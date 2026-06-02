@@ -1,12 +1,13 @@
 """Agent CRUD endpoints for the OpenAgents platform."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from typing import Optional
 from datetime import datetime
 
 from ..models.database import get_db, Agent
 from ..middleware.auth import get_current_user
+from .url_validation import validate_endpoint
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -16,6 +17,17 @@ class AgentCreate(BaseModel):
     description: Optional[str] = None
     model_type: str = "gpt-4"
     config: Optional[dict] = None
+
+
+class AgentRegister(BaseModel):
+    """Agent registration with validated endpoint URL."""
+
+    name: str
+    description: Optional[str] = None
+    model_type: str = "gpt-4"
+    config: Optional[dict] = None
+    # Agent endpoint URL — validated before storage
+    endpoint: str
 
 
 class AgentUpdate(BaseModel):
@@ -38,6 +50,39 @@ async def create_agent(agent: AgentCreate, user=Depends(get_current_user), db=De
     db.commit()
     db.refresh(new_agent)
     return {"id": new_agent.id, "name": new_agent.name, "owner": user["address"]}
+
+
+@router.post("/register")
+async def register_agent(agent: AgentRegister, user=Depends(get_current_user), db=Depends(get_db)):
+    """
+    Register a new agent with validated endpoint URL.
+
+    Validates:
+    - URL must be valid http/https
+    - Endpoint must be reachable (HEAD request, 5s timeout)
+    - Private/internal IPs are blocked (SSRF protection)
+    """
+    # Validate the endpoint URL
+    is_valid, error_msg = await validate_endpoint(agent.endpoint, timeout=5.0)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"Invalid endpoint: {error_msg}")
+
+    # Merge endpoint into config
+    config = agent.config or {}
+    config["endpoint"] = agent.endpoint
+
+    new_agent = Agent(
+        name=agent.name,
+        description=agent.description,
+        model_type=agent.model_type,
+        config=config,
+        owner_id=user["id"],
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_agent)
+    db.commit()
+    db.refresh(new_agent)
+    return {"id": new_agent.id, "name": new_agent.name, "endpoint": agent.endpoint, "owner": user["address"]}
 
 
 @router.get("/")
